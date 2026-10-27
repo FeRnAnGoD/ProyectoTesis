@@ -41,7 +41,10 @@ public class ChatRepository {
     }
 
     public String kind(UUID conversation, boolean lock) {
-        return jdbc.sql("SELECT kind FROM nexo.conversations WHERE id=:id" + (lock ? " FOR UPDATE" : ""))
+        String sql = lock
+                ? "SELECT kind FROM nexo.conversations WHERE id=:id FOR UPDATE"
+                : "SELECT kind FROM nexo.conversations WHERE id=:id";
+        return jdbc.sql(sql)
                 .param("id", conversation).query(String.class).optional()
                 .orElseThrow(() -> new ResponseStatusException(HttpStatus.NOT_FOUND));
     }
