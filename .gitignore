@@ -1,0 +1,33 @@
+# Local configuration and credentials
+.env
+.env.*
+!.env.example
+
+# Frontend
+node_modules/
+dist/
+.angular/
+coverage/
+
+# Backend and tooling
+target/
+__pycache__/
+*.pyc
+.idea/
+.vscode/
+*.log
+.tools/
+.tmp/
+.artifacts/
+tmp/
+*.pptx.inspect.ndjson
+.DS_Store
+Thumbs.db
+
+# Private exports and key material
+*.dump
+*.backup
+*.pem
+*.key
+*.p12
+*.pfx

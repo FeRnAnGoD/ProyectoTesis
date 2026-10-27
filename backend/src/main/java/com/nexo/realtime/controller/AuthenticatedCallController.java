@@ -1,0 +1,101 @@
+package com.nexo.realtime.controller;
+
+import com.nexo.realtime.service.CallService;
+import com.nexo.realtime.service.TurnCredentialService;
+import com.nexo.user.service.CurrentUserService;
+import jakarta.validation.Valid;
+import jakarta.validation.constraints.NotBlank;
+import jakarta.validation.constraints.NotNull;
+import jakarta.validation.constraints.Size;
+import java.util.UUID;
+import java.util.List;
+import org.springframework.security.core.Authentication;
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.PathVariable;
+import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.RequestBody;
+import org.springframework.web.bind.annotation.RequestHeader;
+import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RestController;
+
+@RestController
+@RequestMapping("/api/calls")
+@io.swagger.v3.oas.annotations.security.SecurityRequirement(name = "bearerAuth")
+public class AuthenticatedCallController {
+    private static final String CALL_SESSION_HEADER = "X-Nexo-Call-Session";
+    private final CallService calls;
+    private final CurrentUserService currentUser;
+    private final TurnCredentialService turn;
+
+    public AuthenticatedCallController(CallService calls, CurrentUserService currentUser,
+            TurnCredentialService turn) {
+        this.calls = calls;
+        this.currentUser = currentUser;
+        this.turn = turn;
+    }
+
+    public record StartRequest(
+            @NotNull UUID id,
+            @NotNull UUID calleeId,
+            UUID conversationId,
+            boolean video,
+            @NotBlank @Size(max = 64000) String offer) {}
+
+    public record AnswerRequest(@NotBlank @Size(max = 64000) String answer) {}
+    public record CandidatesRequest(
+            @NotNull @Size(min = 1, max = 32) @Valid List<CallService.IceCandidate> candidates) {}
+
+    @GetMapping("/ice-config")
+    public TurnCredentialService.IceConfig iceConfig(Authentication authentication) {
+        return turn.credentials(currentUser.require(authentication).userId());
+    }
+
+    @GetMapping("/current")
+    public CallService.CallView current(
+            Authentication authentication,
+            @RequestHeader(CALL_SESSION_HEADER) UUID callSession) {
+        return calls.current(actor(authentication, callSession));
+    }
+
+    @PostMapping
+    public CallService.CallView start(
+            Authentication authentication,
+            @RequestHeader(CALL_SESSION_HEADER) UUID callSession,
+            @Valid @RequestBody StartRequest request) {
+        return calls.start(
+                actor(authentication, callSession), request.id(), request.calleeId(), request.offer(),
+                request.conversationId(), request.video());
+    }
+
+    @PostMapping("/{id}/answer")
+    public CallService.CallView answer(
+            Authentication authentication,
+            @RequestHeader(CALL_SESSION_HEADER) UUID callSession,
+            @PathVariable UUID id,
+            @Valid @RequestBody AnswerRequest request) {
+        return calls.answer(actor(authentication, callSession), id, request.answer());
+    }
+
+    @PostMapping("/{id}/candidates")
+    public CallService.CallView candidates(
+            Authentication authentication,
+            @RequestHeader(CALL_SESSION_HEADER) UUID callSession,
+            @PathVariable UUID id,
+            @Valid @RequestBody CandidatesRequest request) {
+        return calls.addCandidates(actor(authentication, callSession), id, request.candidates());
+    }
+
+    @PostMapping("/{id}/{action:accept|reject|end|connected}")
+    public CallService.CallView action(
+            Authentication authentication,
+            @RequestHeader(CALL_SESSION_HEADER) UUID callSession,
+            @PathVariable UUID id,
+            @PathVariable String action) {
+        return calls.action(actor(authentication, callSession), id, action);
+    }
+
+    private CallService.Actor actor(Authentication authentication, UUID callSession) {
+        return new CallService.Actor(
+                currentUser.require(authentication).userId(), callSession.toString());
+    }
+}

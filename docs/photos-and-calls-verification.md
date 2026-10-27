@@ -1,0 +1,85 @@
+# Fotos de perfil y llamadas de voz — verificación local
+
+Fecha: 27 de agosto de 2026. Aplicación ejecutada en localhost con el perfil
+`local-demo`, PostgreSQL en Docker y Angular mediante `ng serve`.
+
+## Actualización: señalización progresiva (15 de octubre de 2026)
+
+La llamada ya no espera a que el navegador termine de reunir todos los candidatos ICE
+antes de enviar la invitación u oferta. Cada extremo publica en lotes pequeños sus
+candidatos a `POST /api/calls/{id}/candidates`; la otra sesión los recoge junto con el
+estado de llamada cada 1,5 segundos y los añade al `RTCPeerConnection` cuando su oferta
+o respuesta remota ya está aplicada. Los candidatos y SDP siguen siendo efímeros y solo
+se comparten con los dos participantes autorizados. La rama también limita la negociación
+si una operación WebRTC deja de responder.
+
+Desde la estación de desarrollo se verificó que la API está saludable, Coturn responde
+una solicitud STUN UDP en 3478 y aceptan TCP los puertos 3478, 7881 y 443. Esta prueba de
+red no confirma el audio entre equipos: se necesita ejecutar la llamada con dos sesiones
+reales y comprobar que ambas reciben audio en redes distintas.
+
+## Actualización del 3 de septiembre de 2026
+
+La señalización dejó de ser exclusiva del modo demo. Ahora `/api/calls` deriva al usuario del
+JWT local o Microsoft y exige un UUID de pestaña en `X-Nexo-Call-Session`. El panel de llamada
+se monta en la aplicación autenticada y los botones están disponibles para cuentas demo,
+locales y Microsoft. Las pruebas de integración cubren el ciclo completo entre cuentas
+locales y el inicio con una identidad Entra; la comprobación manual de audio descrita abajo
+continúa correspondiendo a dos sesiones demo en el mismo equipo.
+
+## Resultado en el navegador
+
+### Foto de perfil
+
+- Se subió una imagen PNG de prueba a la sesión de Jean mediante la API multipart.
+- La API devolvió el perfil actualizado y sirvió una imagen PNG válida.
+- La imagen apareció en la bandeja, cabecera, participantes, mensajes existentes
+  y perfil. Se comprobó que el elemento de imagen terminó de cargar.
+- Desde **Perfil → Quitar foto** se eliminó la imagen; reaparecieron las iniciales
+  y el aviso de confirmación. Se retiró la foto de prueba, sin dejarla como foto del usuario.
+- El selector nativo de archivos no se automatizó: se verificó la subida real
+  por API y la selección, validación, vista previa y guardado mediante pruebas Angular.
+
+### Llamada real Jorge → Jean
+
+- Dos pestañas independientes, Jorge en Mensajes y Jean en Perfil.
+- Jorge pulsó **Llamar a Jean**; Jean recibió **Llamada entrante** y aceptó.
+- Ambos mostraron **Audio conectado** y un contador que avanzó, derivado del
+  estado real de RTCPeerConnection. No se usaron conexiones simuladas en esta prueba.
+- En Jean, el elemento de audio tenía `paused=false`, `readyState=4` y su
+  `currentTime` avanzaba. La conexión permaneció activa durante la comprobación.
+- Se probó **Silenciar → Activar micrófono** y **Finalizar**.
+- Ambas sesiones mostraron **Llamada finalizada**. Se liberaron los recursos locales;
+  la liberación de tracks también está cubierta por las pruebas unitarias.
+- Esta evidencia confirma negociación, conexión y reproducción del flujo remoto.
+  No se evaluó auditivamente la inteligibilidad de la voz ni la calidad acústica.
+
+## Pruebas automatizadas
+
+- Backend: `./mvnw verify`, 16 pruebas sin errores con PostgreSQL de Testcontainers.
+- Frontend: `npm run test:ci`, 39 pruebas en 9 archivos sin errores.
+- Producción frontend: `npm run build`, completado; bundle inicial 298,97 kB.
+- Formato: `npm run format:check`.
+
+Se extendieron las pruebas existentes de backend para cubrir propiedad de la
+foto, recodificación, eliminación, formatos inválidos, límites de tamaño,
+privacidad de señalización, ocupación, aceptación en una sola sesión, respuesta
+SDP, rechazo y cierre. Los tests Angular cubren permiso denegado, cancelación y
+permiso tardío, vencimiento de permiso, respuesta de polling obsoleta, mute,
+liberación de medios y cierre de sesión, además de los flujos existentes de chat.
+
+Los tests unitarios de WebRTC usan dobles de medios para verificar lógica, no
+para demostrar conectividad. Esa comprobación se hizo por separado en el navegador.
+
+## Límites de esta entrega
+
+- Solo audio entre dos usuarios. Sin video, grabación ni llamadas grupales.
+- La demo permite elegir cualquier perfil; no reemplaza autenticación Microsoft.
+- Fotos públicas dentro de la demo local; los cambios requieren la sesión propietaria.
+- Señalización HTTP cada 1,5 s. Audio WebRTC directo, sin STUN/TURN, verificado
+  entre pestañas del mismo equipo. No se comprobó entre equipos o redes distintas.
+- Llamadas temporales en memoria; reiniciar el backend o recargar la página
+  interrumpe la llamada. Fotos y mensajes sí persisten en PostgreSQL.
+- No se automatizan ni eluden permisos del micrófono.
+
+Los pasos para probarlo manualmente y los endpoints están en el [README](../README.md).

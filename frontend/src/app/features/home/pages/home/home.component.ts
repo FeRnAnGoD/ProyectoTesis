@@ -1,0 +1,595 @@
+import {
+  Component,
+  computed,
+  DestroyRef,
+  ElementRef,
+  inject,
+  signal,
+  viewChild,
+} from '@angular/core';
+import { DatePipe } from '@angular/common';
+import { FormControl, FormGroup, ReactiveFormsModule, Validators } from '@angular/forms';
+import { Router, ActivatedRoute, RouterLink } from '@angular/router';
+import { takeUntilDestroyed, toObservable, toSignal } from '@angular/core/rxjs-interop';
+import {
+  catchError,
+  EMPTY,
+  exhaustMap,
+  firstValueFrom,
+  forkJoin,
+  merge,
+  Subject,
+  switchMap,
+  timer,
+} from 'rxjs';
+import { AuthService } from '../../../../core/auth/auth.service';
+import { ChatService } from '../../../../core/services/chat.service';
+import {
+  Conversation,
+  DemoUser,
+  Message,
+  MessageNotification,
+  Workspace,
+} from '../../../../core/models/demo';
+import { AvatarComponent } from '../../../../shared/components/avatar.component';
+import { IconComponent } from '../../../../shared/components/icon.component';
+import { MessageTextComponent } from '../../../../shared/components/message-text.component';
+import { VoiceCallService } from '../../../../core/realtime/voice-call.service';
+import { GroupCallService } from '../../../../core/realtime/group-call.service';
+import {
+  WorkspaceNavigationComponent,
+  WorkspaceView,
+} from '../../components/workspace-navigation.component';
+import {
+  ConversationInboxComponent,
+  InboxFilter,
+} from '../../components/conversation-inbox.component';
+import { ProfilePanelComponent } from '../../components/profile-panel.component';
+import { SettingsPanelComponent } from '../../components/settings-panel.component';
+import { ConversationBroadcastsComponent } from '../../components/conversation-broadcasts.component';
+import { CommunityHeroComponent } from '../../components/community-hero.component';
+import { MessageNotificationsComponent } from '../../components/message-notifications.component';
+
+type ComposerContext = { kind: 'edit' | 'reply'; message: Message };
+
+@Component({
+  selector: 'app-home',
+  imports: [
+    ReactiveFormsModule,
+    DatePipe,
+    AvatarComponent,
+    IconComponent,
+    MessageTextComponent,
+    WorkspaceNavigationComponent,
+    ConversationInboxComponent,
+    ProfilePanelComponent,
+    SettingsPanelComponent,
+    ConversationBroadcastsComponent,
+    CommunityHeroComponent,
+    MessageNotificationsComponent,
+    RouterLink,
+  ],
+  templateUrl: './home.component.html',
+  styleUrl: './home.component.css',
+})
+export class HomeComponent {
+  readonly auth = inject(AuthService);
+  readonly calls = inject(VoiceCallService);
+  readonly groupCalls = inject(GroupCallService);
+  private readonly chat = inject(ChatService);
+  private readonly router = inject(Router);
+  private readonly route = inject(ActivatedRoute);
+  private readonly destroyRef = inject(DestroyRef);
+  readonly workspace = signal<Workspace>({ channels: [], directs: [], people: [] });
+  readonly notifications = computed(() => this.workspace().notifications ?? []);
+  readonly notificationBusy = signal(false);
+  readonly providerLabel = computed(() => {
+    switch (this.auth.session.kind()) {
+      case 'demo':
+        return 'el modo demostración local';
+      case 'local':
+        return 'una cuenta local Nexo';
+      default:
+        return 'Microsoft Entra ID';
+    }
+  });
+  readonly dashboardView = signal<'home' | 'explore' | 'communities' | 'messages' | 'calls'>(
+    'home',
+  );
+  readonly activeId = signal(this.route.snapshot.queryParamMap.get('conversation') ?? '');
+  readonly active = computed(() =>
+    [...this.workspace().channels, ...this.workspace().directs].find(
+      (c) => c.id === this.activeId(),
+    ),
+  );
+  readonly view = signal<WorkspaceView>('chat');
+  readonly inboxOpen = signal(window.innerWidth <= 760);
+  readonly inboxFilter = signal<InboxFilter>('all');
+  readonly peer = computed(() =>
+    this.workspace().people.find((person) => person.id === this.active()?.peerId),
+  );
+  readonly detailsOpen = signal(window.innerWidth >= 1200);
+  readonly initialLoading = signal(true);
+  readonly messagesLoading = signal(false);
+  readonly connected = signal(false);
+  readonly connectionError = signal('');
+  readonly actionError = signal('');
+  readonly actionBusy = signal(false);
+  readonly profileOpen = signal(false);
+  readonly viewedProfile = signal<DemoUser | null>(null);
+  readonly settingsOpen = signal(false);
+  readonly sending = signal(false);
+  readonly messageActionBusy = signal('');
+  readonly messageActionNotice = signal('');
+  readonly copiedMessageId = signal('');
+  readonly composerContext = signal<ComposerContext | null>(null);
+  readonly forwardingMessage = signal<Message | null>(null);
+  readonly messages = signal<Message[]>([]);
+  readonly members = signal<DemoUser[]>([]);
+  readonly filter = new FormControl('', { nonNullable: true });
+  readonly filterValue = toSignal(this.filter.valueChanges, { initialValue: '' });
+  readonly draft = new FormControl('', {
+    nonNullable: true,
+    validators: [Validators.required, Validators.maxLength(2000)],
+  });
+  readonly draftText = toSignal(this.draft.valueChanges, { initialValue: '' });
+  readonly composer = new FormGroup({ body: this.draft });
+  readonly channels = computed(() =>
+    this.workspace().channels.filter((c) => this.matches(c.title)),
+  );
+  readonly people = computed(() =>
+    this.workspace().people.filter(
+      (p) => p.id !== this.auth.session.user()?.id && this.matches(p.displayName),
+    ),
+  );
+  readonly joinedCount = computed(() => this.workspace().channels.filter((c) => c.joined).length);
+  readonly inboxChannels = computed(() => this.channels().filter((c) => c.joined));
+  readonly onlineCount = computed(() => this.workspace().people.filter((p) => p.online).length);
+  readonly forwardTargets = computed(() =>
+    [...this.workspace().channels, ...this.workspace().directs].filter(
+      (conversation) => conversation.joined && conversation.id !== this.activeId(),
+    ),
+  );
+  readonly messageList = viewChild<ElementRef<HTMLElement>>('messageList');
+  readonly profilePanel = viewChild(ProfilePanelComponent);
+  private readonly refreshWorkspace = new Subject<void>();
+  private readonly refreshMessages = new Subject<void>();
+  private readonly drafts = new Map<string, string>();
+  private pendingSend: { conversation: string; body: string; clientId: string } | null = null;
+  private draftBeforeEdit = '';
+  private readonly selected = computed(() => {
+    const c = this.active();
+    return c?.joined ? c.id : '';
+  });
+
+  constructor() {
+    merge(timer(0, 5000), this.refreshWorkspace)
+      .pipe(
+        exhaustMap(() =>
+          this.chat.workspace().pipe(
+            catchError(() => {
+              this.connectionError.set('Conexión interrumpida. Reintentando automáticamente…');
+              this.connected.set(false);
+              this.initialLoading.set(false);
+              return EMPTY;
+            }),
+          ),
+        ),
+        takeUntilDestroyed(this.destroyRef),
+      )
+      .subscribe((workspace) => {
+        this.workspace.set(workspace);
+        const current = this.auth.session.user();
+        const refreshed = workspace.people.find((person) => person.id === current?.id);
+        if (
+          refreshed &&
+          current &&
+          (refreshed.avatarUrl !== current.avatarUrl ||
+            refreshed.displayName !== current.displayName ||
+            refreshed.username !== current.username ||
+            refreshed.bio !== current.bio ||
+            refreshed.color !== current.color ||
+            refreshed.availability !== current.availability)
+        )
+          this.auth.session.user.set({ ...refreshed, email: current.email });
+        this.initialLoading.set(false);
+        this.connectionError.set('');
+        this.connected.set(true);
+        if (!this.active() && workspace.channels.length)
+          this.activeId.set(
+            workspace.channels.find((c) => c.slug === 'general')?.id ?? workspace.channels[0].id,
+          );
+      });
+    toObservable(this.selected)
+      .pipe(
+        switchMap((id) => {
+          this.messages.set([]);
+          this.members.set([]);
+          this.messagesLoading.set(!!id);
+          if (!id) return EMPTY;
+          return merge(timer(0, 2000), this.refreshMessages).pipe(
+            exhaustMap(() =>
+              forkJoin({
+                messages: this.chat.messages(id),
+                members: this.chat.members(id),
+              }).pipe(
+                catchError(() => {
+                  this.messagesLoading.set(false);
+                  this.connected.set(false);
+                  this.connectionError.set('No se pudo actualizar la conversación. Reintentando…');
+                  this.refreshWorkspace.next();
+                  return EMPTY;
+                }),
+              ),
+            ),
+          );
+        }),
+        takeUntilDestroyed(this.destroyRef),
+      )
+      .subscribe((result) => {
+        const element = this.messageList()?.nativeElement;
+        const nearBottom =
+          !element || element.scrollHeight - element.scrollTop - element.clientHeight < 120;
+        const first = this.messagesLoading();
+        const changed = this.messages().at(-1)?.id !== result.messages.at(-1)?.id;
+        this.messages.set(result.messages);
+        this.members.set(result.members);
+        this.messagesLoading.set(false);
+        this.connected.set(true);
+        this.connectionError.set('');
+        if (first || (changed && nearBottom)) requestAnimationFrame(() => this.scrollBottom());
+      });
+  }
+
+  private matches(value: string): boolean {
+    return value.toLowerCase().includes(this.filterValue().trim().toLowerCase());
+  }
+  select(conversation: Conversation): void {
+    this.cancelComposerContext();
+    this.forwardingMessage.set(null);
+    this.drafts.set(this.activeId(), this.draft.value);
+    this.activeId.set(conversation.id);
+    this.draft.setValue(this.drafts.get(conversation.id) ?? '');
+    this.view.set('chat');
+    this.inboxOpen.set(false);
+    if (window.innerWidth < 1200) this.detailsOpen.set(false);
+    this.actionError.set('');
+    void this.router.navigate([], {
+      relativeTo: this.route,
+      queryParams: { conversation: conversation.id },
+      replaceUrl: true,
+    });
+  }
+  navigate(view: WorkspaceView): void {
+    this.view.set(view);
+    if (view === 'chat') this.inboxOpen.set(true);
+    this.filter.setValue('');
+    this.actionError.set('');
+  }
+  openOwnProfile(): void {
+    this.viewedProfile.set(null);
+    this.settingsOpen.set(false);
+    if (window.matchMedia('(max-width: 760px)').matches) {
+      void this.router.navigate(['/profile']);
+      return;
+    }
+    this.profileOpen.set(true);
+  }
+  openUserProfile(userId: string): void {
+    const user =
+      this.members().find((person) => person.id === userId) ??
+      this.workspace().people.find((person) => person.id === userId);
+    if (!user || user.id === this.auth.session.user()?.id) return;
+    this.profileOpen.set(false);
+    this.settingsOpen.set(false);
+    this.viewedProfile.set(user);
+  }
+  closeViewedProfile(): void {
+    this.viewedProfile.set(null);
+  }
+  openSettings(): void {
+    this.profileOpen.set(false);
+    this.settingsOpen.set(true);
+  }
+  requestProfileClose(): void {
+    this.profilePanel()?.requestClose();
+  }
+  profileUpdated(user: DemoUser): void {
+    this.auth.session.user.set(user);
+    this.workspace.update((workspace) => ({
+      ...workspace,
+      people: workspace.people.map((person) =>
+        person.id === user.id ? { ...person, ...user } : person,
+      ),
+    }));
+    this.members.update((members) =>
+      members.map((person) => (person.id === user.id ? { ...person, ...user } : person)),
+    );
+    this.messages.update((messages) =>
+      messages.map((message) =>
+        message.senderId === user.id
+          ? {
+              ...message,
+              senderName: user.displayName,
+              senderColor: user.color,
+              senderAvatarUrl: user.avatarUrl,
+            }
+          : message,
+      ),
+    );
+    this.refreshWorkspace.next();
+    this.refreshMessages.next();
+  }
+  async openNotification(notification: MessageNotification): Promise<void> {
+    if (this.notificationBusy()) return;
+    const conversation = [...this.workspace().channels, ...this.workspace().directs].find(
+      (item) => item.id === notification.conversationId && item.joined,
+    );
+    if (!conversation) {
+      this.actionError.set('Esta conversación ya no está disponible.');
+      this.refreshWorkspace.next();
+      return;
+    }
+    this.select(conversation);
+    this.notificationBusy.set(true);
+    this.actionError.set('');
+    try {
+      await firstValueFrom(
+        this.chat.readNotification(notification.conversationId, notification.messageId),
+      );
+      this.workspace.update((workspace) => ({
+        ...workspace,
+        notifications: workspace.notifications?.filter(
+          (item) => item.messageId !== notification.messageId,
+        ),
+      }));
+      this.refreshWorkspace.next();
+    } catch {
+      this.actionError.set('No pudimos marcar el aviso como leído. Vuelve a intentarlo.');
+    } finally {
+      this.notificationBusy.set(false);
+    }
+  }
+  async membership(conversation: Conversation, join: boolean): Promise<void> {
+    if (this.actionBusy()) return;
+    this.actionBusy.set(true);
+    this.actionError.set('');
+    try {
+      await firstValueFrom(
+        join ? this.chat.join(conversation.id) : this.chat.leave(conversation.id),
+      );
+      this.workspace.set(await firstValueFrom(this.chat.workspace()));
+      if (join) {
+        const updated = this.workspace().channels.find((c) => c.id === conversation.id);
+        if (updated) this.select(updated);
+      } else {
+        this.messages.set([]);
+        this.members.set([]);
+      }
+    } catch {
+      this.actionError.set('No pudimos cambiar tu membresía. Vuelve a intentarlo.');
+    } finally {
+      this.actionBusy.set(false);
+    }
+  }
+  async direct(person: DemoUser): Promise<void> {
+    if (this.actionBusy()) return;
+    this.actionBusy.set(true);
+    this.actionError.set('');
+    try {
+      const conversation = await firstValueFrom(this.chat.direct(person.id));
+      this.workspace.set(await firstValueFrom(this.chat.workspace()));
+      this.select(conversation);
+    } catch {
+      this.actionError.set('No pudimos abrir la conversación. Inténtalo de nuevo.');
+    } finally {
+      this.actionBusy.set(false);
+    }
+  }
+  async startCall(person: DemoUser): Promise<void> {
+    const conversation = this.workspace().directs.find((item) => item.peerId === person.id);
+    if (conversation) {
+      await this.calls.start(person, conversation.id);
+      return;
+    }
+    try {
+      const created = await firstValueFrom(this.chat.direct(person.id));
+      this.workspace.update((workspace) => ({
+        ...workspace,
+        directs: workspace.directs.some((item) => item.id === created.id)
+          ? workspace.directs
+          : [...workspace.directs, created],
+      }));
+      await this.calls.start(person, created.id);
+    } catch {
+      this.actionError.set('No pudimos preparar la conversación para la llamada.');
+    }
+  }
+  async send(): Promise<void> {
+    const conversation = this.active();
+    const body = this.draft.value.trim();
+    if (!conversation?.joined || !body || this.draft.invalid || this.sending()) return;
+    this.sending.set(true);
+    this.actionError.set('');
+    const context = this.composerContext();
+    if (context?.kind === 'edit') {
+      try {
+        const updated = await firstValueFrom(
+          this.chat.edit(conversation.id, context.message.id, body),
+        );
+        this.messages.update((messages) =>
+          messages.map((message) => (message.id === updated.id ? updated : message)),
+        );
+        this.draft.setValue(this.draftBeforeEdit);
+        this.composerContext.set(null);
+        this.notifyMessageAction('Mensaje editado correctamente.');
+      } catch {
+        this.actionError.set('No pudimos editar el mensaje. El texto permanece en el editor.');
+      } finally {
+        this.sending.set(false);
+      }
+      return;
+    }
+    const outgoingBody = context?.kind === 'reply' ? this.replyBody(context.message, body) : body;
+    if (outgoingBody.length > 2000) {
+      this.actionError.set('La respuesta supera el máximo de 2000 caracteres. Acorta el texto.');
+      this.sending.set(false);
+      return;
+    }
+    if (
+      !this.pendingSend ||
+      this.pendingSend.conversation !== conversation.id ||
+      this.pendingSend.body !== outgoingBody
+    ) {
+      this.pendingSend = {
+        conversation: conversation.id,
+        body: outgoingBody,
+        clientId: crypto.randomUUID(),
+      };
+    }
+    const pending = this.pendingSend;
+    try {
+      await firstValueFrom(this.chat.send(pending.conversation, pending.body, pending.clientId));
+      this.drafts.delete(conversation.id);
+      if (this.activeId() === conversation.id && this.draft.value.trim() === body)
+        this.draft.setValue('');
+      this.composerContext.set(null);
+      this.pendingSend = null;
+      this.refreshMessages.next();
+      requestAnimationFrame(() => this.scrollBottom());
+    } catch {
+      this.actionError.set(
+        'No se confirmó el envío. Tu texto está guardado en esta pestaña; vuelve a enviar para reintentar sin duplicarlo.',
+      );
+    } finally {
+      this.sending.set(false);
+    }
+  }
+  onComposerKey(event: KeyboardEvent): void {
+    if (event.key === 'Enter' && !event.shiftKey && !event.isComposing) {
+      event.preventDefault();
+      void this.send();
+    }
+  }
+  startEdit(message: Message): void {
+    if (message.senderId !== this.auth.session.user()?.id || this.messageActionBusy()) return;
+    this.cancelComposerContext();
+    this.draftBeforeEdit = this.draft.value;
+    this.composerContext.set({ kind: 'edit', message });
+    this.forwardingMessage.set(null);
+    this.draft.setValue(message.body);
+    this.focusComposer();
+  }
+  startReply(message: Message): void {
+    if (this.messageActionBusy()) return;
+    this.cancelComposerContext();
+    this.composerContext.set({ kind: 'reply', message });
+    this.forwardingMessage.set(null);
+    this.focusComposer();
+  }
+  cancelComposerContext(): void {
+    const context = this.composerContext();
+    if (context?.kind === 'edit') this.draft.setValue(this.draftBeforeEdit);
+    this.composerContext.set(null);
+  }
+  toggleForward(message: Message): void {
+    this.cancelComposerContext();
+    this.forwardingMessage.update((current) => (current?.id === message.id ? null : message));
+  }
+  async copyMessage(message: Message): Promise<void> {
+    try {
+      await navigator.clipboard.writeText(message.body);
+      this.copiedMessageId.set(message.id);
+      this.notifyMessageAction('Mensaje copiado al portapapeles.');
+      window.setTimeout(() => {
+        if (this.copiedMessageId() === message.id) this.copiedMessageId.set('');
+      }, 1800);
+    } catch {
+      this.actionError.set('El navegador no permitió copiar el mensaje.');
+    }
+  }
+  async deleteMessage(message: Message): Promise<void> {
+    if (message.senderId !== this.auth.session.user()?.id || this.messageActionBusy()) return;
+    if (!window.confirm('¿Quieres borrar este mensaje? Esta acción no se puede deshacer.')) return;
+    this.messageActionBusy.set('delete:' + message.id);
+    this.actionError.set('');
+    try {
+      await firstValueFrom(this.chat.deleteMessage(message.conversationId, message.id));
+      this.messages.update((messages) => messages.filter((current) => current.id !== message.id));
+      if (this.composerContext()?.message.id === message.id) this.cancelComposerContext();
+      this.notifyMessageAction('Mensaje eliminado.');
+    } catch {
+      this.actionError.set('No pudimos borrar el mensaje. Inténtalo nuevamente.');
+    } finally {
+      this.messageActionBusy.set('');
+    }
+  }
+  async forwardTo(conversation: Conversation): Promise<void> {
+    const message = this.forwardingMessage();
+    if (!message || this.messageActionBusy() || !conversation.joined) return;
+    this.messageActionBusy.set('forward:' + message.id);
+    this.actionError.set('');
+    const body = `Reenviado de ${message.senderName}:\n${message.body}`.slice(0, 2000);
+    try {
+      await firstValueFrom(this.chat.send(conversation.id, body, crypto.randomUUID()));
+      this.forwardingMessage.set(null);
+      this.notifyMessageAction(`Mensaje reenviado a ${conversation.title}.`);
+      if (conversation.id === this.activeId()) this.refreshMessages.next();
+    } catch {
+      this.actionError.set('No pudimos reenviar el mensaje. Inténtalo nuevamente.');
+    } finally {
+      this.messageActionBusy.set('');
+    }
+  }
+  async logout(): Promise<void> {
+    if (this.actionBusy()) return;
+    this.actionBusy.set(true);
+    if (this.calls.occupied()) await this.calls.hangUp();
+    const revoked = await this.auth.logout();
+    await this.router.navigate(['/login'], {
+      queryParams: revoked ? {} : { reason: 'local-only' },
+    });
+  }
+  retry(): void {
+    this.refreshWorkspace.next();
+    this.refreshMessages.next();
+  }
+  openDashboard(
+    view: 'home' | 'explore' | 'communities' | 'messages' | 'calls',
+    event?: Event,
+  ): void {
+    event?.preventDefault();
+    this.dashboardView.set(view);
+    const target =
+      view === 'home'
+        ? 'dashboard-top'
+        : view === 'messages' || view === 'calls'
+          ? 'activity'
+          : 'communities';
+    document.getElementById(target)?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  }
+  newDay(index: number): boolean {
+    return (
+      index === 0 ||
+      new Date(this.messages()[index].sentAt).toDateString() !==
+        new Date(this.messages()[index - 1].sentAt).toDateString()
+    );
+  }
+  private replyBody(message: Message, body: string): string {
+    const excerpt = message.body.replace(/\s+/g, ' ').trim().slice(0, 240);
+    return `Respuesta a ${message.senderName}: “${excerpt}${message.body.length > 240 ? '…' : ''}”\n\n${body}`;
+  }
+  private focusComposer(): void {
+    queueMicrotask(() => document.getElementById('message-input')?.focus());
+  }
+  private notifyMessageAction(message: string): void {
+    this.messageActionNotice.set(message);
+    window.setTimeout(() => {
+      if (this.messageActionNotice() === message) this.messageActionNotice.set('');
+    }, 2600);
+  }
+  private scrollBottom(): void {
+    const element = this.messageList()?.nativeElement;
+    if (element) element.scrollTop = element.scrollHeight;
+  }
+}
